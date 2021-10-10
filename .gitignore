@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
+dataset/
+Prediction_results/
 __pycache__/
 *.py[cod]
 *$py.class
