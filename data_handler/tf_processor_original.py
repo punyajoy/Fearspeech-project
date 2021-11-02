@@ -117,13 +117,67 @@ class Normal_Dataset():
             sampler = SequentialSampler(data)
         return DataLoader(data, sampler=sampler, batch_size=self.batch_size)
 
+
     
     
-class Modified_Dataset(Normal_Dataset):
-    def __init__(self, data, tokenizer=None,  target_dict=None, params=None,train = False):
+
+
+class External_Dataset(Normal_Dataset):
+    def __init__(self, data, tokenizer=None, label_dict=None, params=None,train = False):
         self.data = data
         self.params= params
         self.batch_size = self.params['batch_size']
+        self.train = train
+        self.label_dict=label_dict
+        self.max_length=params['max_length']        
+        self.count_dic = {}
+        self.tokenizer = tokenizer
+        self.inputs, self.attn, self.labels, self.sentences = self.process_data(self.data)
+        self.DataLoader = self.get_dataloader(self.inputs, self.attn, self.labels)
+    
+    
+    def process_data(self, data):
+        sentences, labels, attn = [], [], []
+        count_error=0
+        for label, sentence in tqdm(zip(list(data['label']),list(data['text'])),total=len(data['label'])):
+            labels.append(self.label_dict[label])
+            try:
+                sentence = self.preprocess_func(sentence)
+            except TypeError:
+                count_error+=1
+                sentence = self.preprocess_func("dummy text")
+            
+            sentences.append(sentence)
+            #print(sentence,label)
+        print(random.sample(sentences, 5))
+        print("No. of empty sequences", count_error)
+        inputs, attn_mask = self.tokenize(sentences)
+        return inputs, attn_mask, torch.LongTensor(labels), sentences
+    
+                                   
+    def get_dataloader(self, inputs, attn_mask, labels, train = True):
+        inputs = pad_sequences(inputs,maxlen=int(self.params['max_length']), dtype="long", 
+                          value=self.tokenizer.pad_token_id, truncating="post", padding="post")
+        attention_mask= self.get_attention_mask(attn_mask, maxlen=int(self.params['max_length']))
+                                   
+                                   
+        input_ids=torch.tensor(inputs)
+        attention_mask=torch.tensor(attention_mask)
+        data = TensorDataset(input_ids,attention_mask,labels)
+        if self.train:
+            sampler = RandomSampler(data)
+        else:
+            sampler = SequentialSampler(data)
+        return DataLoader(data, sampler=sampler, batch_size=self.batch_size)
+
+      
+    
+class Modified_Dataset(Normal_Dataset):
+    def __init__(self, data, tokenizer=None,  target_dict=None, annotator_dict=None, params=None,train = False):
+        self.data = data
+        self.params= params
+        self.batch_size = self.params['batch_size']
+        self.annotator_dict=annotator_dict
         self.train = train
         self.label_dict={'normal':0,'fearspeech':1,'hatespeech':2}
         if(self.params['use_targets']):
@@ -154,6 +208,9 @@ class Modified_Dataset(Normal_Dataset):
             dict_output['emotion']=[]
         if(self.params['use_targets']):
             dict_output['targets']=[]
+        if(self.params['labels_agg'] =='crowdlayer'):
+            dict_output['labels_mask']=[]
+        
         
         count_error=0
         for index,row in data.iterrows():
@@ -174,6 +231,19 @@ class Modified_Dataset(Normal_Dataset):
                     temp=[0,0,0]
                     for label in count.keys(): 
                         temp[self.label_dict[label]]=count[label]/len(row['annotations'])  
+                elif(self.params['labels_agg'] =='crowdlayer'):
+                    temp=[[-1,-1,-1]]*len(self.annotator_dict)
+                    temp_mask=[0]*len(self.annotator_dict)
+                    for anno in row['annotations']:
+                        temp_label=[0,0,0]
+                        for label in anno['Class']:
+                            try:
+                                 temp_label[self.label_dict[label]]=1
+                            except KeyError:
+                                print(label)
+                        temp[self.annotator_dict[anno['WorkerId']]]=temp_label
+                        temp_mask[self.annotator_dict[anno['WorkerId']]]=1
+
                 else:
                     print("Label aggregation method not found")
             else:
@@ -233,7 +303,9 @@ class Modified_Dataset(Normal_Dataset):
                 dict_output['attn_mask'].append([1]*len(inputs))
             dict_output['sentences'].append(sentence)
             dict_output['labels'].append(list(temp))
-            
+            if(self.params['labels_agg'] =='crowdlayer' and self.train==False):
+                dict_output['labels_mask'].append(list(temp_mask))
+                
             
             if('emotion' in self.params['features']):
                 emotions = []
@@ -277,7 +349,11 @@ class Modified_Dataset(Normal_Dataset):
                 tensor_list.append(torch.Tensor(dict_features['targets']))
             
             
+            if(self.params['labels_agg'] =='crowdlayer'):
+                tensor_list.append(torch.Tensor(dict_features['labels_mask']))
+            
                 
+             
     
                                    
         
@@ -293,15 +369,18 @@ class Modified_Dataset(Normal_Dataset):
     
 #Predictions class
 class Prediction_Dataset():
-    def __init__(self, data, tokenizer=None,  params=None):
+    def __init__(self, data, tokenizer=None,  params=None, train=False):
         self.data = data
         self.params= params
         self.batch_size = self.params['batch_size']
+        self.train = train
         self.label_dict={'normal':0,'fearspeech':1,'hatespeech':2}
         self.max_length=params['max_length']        
+        self.count_dic = {}
         self.tokenizer = tokenizer
-        self.inputs, self.attn = self.process_data(self.data)
-        self.DataLoader = self.get_dataloader(self.inputs, self.attn)
+        self.dict_features= self.process_data(self.data)
+        self.DataLoader = self.get_dataloader(self.dict_features,self.train)
+        
     
     def preprocess_func(self, text):
         remove_words=['<allcaps>','</allcaps>','<hashtag>','</hashtag>','<elongated>','<emphasis>','<repeated>','\'','s']
@@ -325,40 +404,86 @@ class Prediction_Dataset():
     
     
     def process_data(self, data):
-        sentences, attn = [], []
+        dict_output={'inputs':[],'attn_mask':[],'sentences':[]}
+        if('rationales' in self.params['features']):
+            dict_output['rationales']=[]
+        if('emotion' in self.params['features']):
+            dict_output['emotion']=[]
+        
         count_error=0
-        for element in data:
+        for row in data:
             try:
-                sentence = self.preprocess_func(element['body'])
+                sentence = self.preprocess_func(row['body'])
             except TypeError:
                 count_error+=1
                 sentence = self.preprocess_func("dummy text")
-            sentences.append(sentence)
-            #print(sentence,label)
+            
+            if('rationales' in self.params['features']):        
+                special_tokens = self.tokenizer.encode("", add_special_tokens=True, truncation=True, max_length=(self.max_length))
+
+                inputs = []
+                rationales = []
+                inputs.append(special_tokens[0])
+                rationales.append(0)
+
+                for key in row['rationale_dict'].keys():
+                    inputs.append(self.tokenizer.convert_tokens_to_ids(key))
+                    rationales.append(float(row['rationale_dict'][key]))
+
+                inputs.append(special_tokens[1])
+                rationales.append(0)
+                dict_output['rationales'].append(rationales)
+                dict_output['inputs'].append(inputs)
+                dict_output['attn_mask'].append([1]*len(inputs))
+            dict_output['sentences'].append(sentence)
+            if('emotion' in self.params['features']):
+                emotions = []
+                for key in row['emotion_dict'].keys():
+                        emotions.append(float(row['emotion_dict'][key]))
+                dict_output['emotion'].append(emotions)
+            
+            
         print("No. of empty sequences", count_error)
-        inputs, attn_mask = self.tokenize(sentences)
-        return inputs, attn_mask
-    
-    
+        
+        if('rationales' not in self.params['features']):
+            dict_output['inputs'],dict_output['attn_mask'] = self.tokenize(dict_output['sentences'])
+        
+        
+        
+        return dict_output
+                                
+    def get_dataloader(self, dict_features, train = True):
+        tensor_list=[]
+        for key in dict_features.keys():
+            
+            if (key == 'inputs'):
+                inputs = pad_sequences(dict_features['inputs'],maxlen=int(self.params['max_length']), dtype="long", 
+                          value=self.tokenizer.pad_token_id, truncating="post", padding="post")
+                tensor_list.append(torch.tensor(inputs))
+            if (key == 'attn_mask'):
+                attention_mask= self.get_attention_mask(dict_features['attn_mask'], maxlen=int(self.params['max_length']))
+                tensor_list.append(torch.Tensor(attention_mask))
+            if (key == 'rationales'):
+                rationales= self.get_attention_mask(dict_features['rationales'], maxlen=int(self.params['max_length']))
+                tensor_list.append(torch.Tensor(rationales))
+            if (key == 'emotion'):
+                tensor_list.append(torch.Tensor(dict_features['emotion']))
+            
+            
+        
+        data = TensorDataset(*tensor_list)
+        if self.train:
+            sampler = RandomSampler(data)
+        else:
+            sampler = SequentialSampler(data)
+        return DataLoader(data, sampler=sampler, batch_size=self.batch_size)
+
     def get_attention_mask(self,attn_mask, maxlen=128):
         attn_mask_modified=[]
         for attn in attn_mask:
             attn = attn + [0]*(maxlen-len(attn))
             attn_mask_modified.append(attn)
         return attn_mask_modified
-                                   
-    def get_dataloader(self, inputs, attn_mask):
-        inputs = pad_sequences(inputs,maxlen=int(self.params['max_length']), dtype="long", 
-                          value=self.tokenizer.pad_token_id, truncating="post", padding="post")
-        attention_mask= self.get_attention_mask(attn_mask, maxlen=int(self.params['max_length']))
-                                   
-                                   
-        input_ids=torch.tensor(inputs)
-        attention_mask=torch.tensor(attention_mask)
-        data = TensorDataset(input_ids,attention_mask)
-        sampler = SequentialSampler(data)
-        return DataLoader(data, sampler=sampler, batch_size=self.batch_size)
- 
     
 #rationale labels
 class Rationales_Dataset():
