@@ -18,7 +18,7 @@ from apiconfig import project_name,api_token
 import neptune.new as neptune
 import GPUtil
 import argparse
-model_memory=9
+model_memory=10
 total_memory=16
 
 def get_gpu(gpu_id):
@@ -55,11 +55,12 @@ def save_detection_model(model,tokenizer,params):
         output_dir+='_targets'
         
     output_dir+='_'+params['labels_agg']
-    output_dir+='_fear_hate/'
+    output_dir+='_external/'
     # Create output directory if needed
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     print("Saving model to %s" % output_dir)
+    model=model.bert
     model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
     model_to_save.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -78,7 +79,7 @@ def save_json(dict1,type1,params):
         output_dir+='_targets'
         
     output_dir+='_'+params['labels_agg']
-    output_dir+='_fear_hate_'+type1+'.json'
+    output_dir+='_external_'+type1+'.json'
     with open(output_dir, 'w') as outfile:
          json.dump(dict1, outfile, indent=2, cls=NumpyEncoder)
                 
@@ -110,7 +111,7 @@ def evalphase(params,run,which_files='test',model=None,test_dataloader=None,devi
     print("Running eval on ",which_files,"...")
     logits_all=[]
     true_labels=[]
-    pred_labels_raw=[]
+    pred_labels=[]
     t0 = time.time()
     model.eval()
     # Evaluate data for one epoch
@@ -131,44 +132,30 @@ def evalphase(params,run,which_files='test',model=None,test_dataloader=None,devi
         input_ids=batch[0]
         attention_mask=batch[1]
         labels=batch[2]
-        rationales=None
-        emotions=None
-        targets=None
-        ind=2
-        if('rationales' in params['features']):
-            ind+=1
-            rationales=batch[ind]
-        if('emotion' in params['features']):
-            ind+=1
-            emotions=batch[ind]
-        if(params['use_targets']):
-            ind+=1
-            targets=batch[ind]
 
-        label_ids = labels.detach().to('cpu').numpy()
         
         
         # (source: https://stackoverflow.com/questions/48001598/why-do-we-need-to-call-zero-grad-in-pytorch)
         model.zero_grad()        
-        outputs = model(input_ids=input_ids,attention_mask=attention_mask,labels=None,
-                            rationales=rationales,emotion_vector=emotions,targets=None)
+        outputs = model(input_ids=input_ids,attention_mask=attention_mask,labels=None)
         logits = outputs
         
-        # Move logits and labels to CPU
-        logits = logits.detach().cpu().numpy()
-        #label_ids = b_labels.detach().to('cpu').numpy()
         # Calculate the accuracy for this batch of test sentences.
         # Accumulate the total accuracy.
-        pred_labels_raw+=list(logits)
-        true_labels+=list(label_ids)
+        logits = logits.detach().cpu().numpy()
+        label_ids = labels.detach().to('cpu').numpy()
+        # Calculate the accuracy for this batch of test sentences.
+        # Accumulate the total accuracy.
+        pred_labels+=list(np.argmax(logits, axis=1).flatten())
+        true_labels+=list(label_ids.flatten())
         logits_all+=list(logits)
     
     
     
     
     
-    pred_labels = np.array(pred_labels_raw) >= 0.5
-    true_labels = np.array([list(element) for element in true_labels])
+#     pred_labels = np.array(pred_labels_raw) >= 0.5
+#     true_labels = np.array([list(element) for element in true_labels])
     
     test_f1=f1_score(true_labels, pred_labels, average='macro')
     test_acc=accuracy_score(true_labels,pred_labels)
@@ -203,7 +190,7 @@ def evalphase(params,run,which_files='test',model=None,test_dataloader=None,devi
     #print(ConfusionMatrix(true_labels,pred_labels))
 
 
-    return key_dict, true_labels, pred_labels_raw
+    return key_dict, true_labels, pred_labels
 
 def return_targets(dataset,threshold=20):
     label_dict={}
@@ -225,23 +212,6 @@ def return_targets(dataset,threshold=20):
     return target_dict
 
 
-def labels_weights(dataset):
-    fear=0
-    normal=0
-    hate=0
-    total=0
-    for index,row in dataset.iterrows():
-        if('fearspeech' in row['majority_label']):
-            fear+=1
-        elif('hatespeech' in row['majority_label']):
-            hate+=1
-        elif('normal' in row['majority_label']):
-            normal+=1
-        total+=1
-    class_weights=[total/normal,total/fear,total/hate]
-    return class_weights
-        
-
 
 def train(params,run, device):
     if(run!=None):
@@ -249,10 +219,14 @@ def train(params,run, device):
 
     tokenizer = AutoTokenizer.from_pretrained(params['model_path'],use_fast=False, cache_dir=params['cache_path'])
         
-    with open('dataset/dataset_split.json', 'r') as fp:
+    with open('../External_dataset/dynamic_hate/final_dataset_splits.json', 'r') as fp:
             post_id_dict=json.load(fp)
-    with open('dataset/final_dataset_emotion_rationale.json', 'r') as fp:
+    with open('../External_dataset/dynamic_hate/final_dataset.json', 'r') as fp:
             json_data=json.load(fp)
+    with open('../External_dataset/dynamic_hate/label_dict.json', 'r') as fp:
+            label_dict=json.load(fp)
+    
+    
     
     dataset=pd.DataFrame(json_data).transpose()
     X_train=dataset[dataset['id'].isin(post_id_dict['train'])]
@@ -261,61 +235,37 @@ def train(params,run, device):
     print(len(X_train),len(X_val),len(X_test))
     print(X_train.columns)
     
-    
-    class_weights=labels_weights(X_train)
-    print(class_weights)
-    class_weights=torch.tensor(class_weights).to(device)
-    if(params['model']!='bert'):
-        pass
-        ### Functions to extract features
-        ### Train the model
-        ### predict outputs
-        ### Evaluate outputs
-        return
-    
-    
-    target_dict=None
-    annotator_dict=None
-    if(params['use_targets']):
-        target_dict = return_targets(dataset,threshold=20)
-        params['targets_num']=len(target_dict)
-    
-    
-    if('deberta' in params['model_path']):
-        params['batch_size']=8
-    
+   
+
+
     
     #### Need to change in case of other datasets
-    train_data_source = Modified_Dataset(X_train,tokenizer,target_dict,annotator_dict,params,train = True)
-    train_data_source_for_test = Modified_Dataset(X_train,tokenizer,target_dict,annotator_dict,params)
-    val_data_source = Modified_Dataset(X_val,tokenizer,target_dict,annotator_dict,params)
-    test_data_source = Modified_Dataset(X_test,tokenizer,target_dict,annotator_dict,params)
+    train_data_source = External_Dataset(X_train,tokenizer,label_dict,params,train = True)
+    val_data_source = External_Dataset(X_val,tokenizer,label_dict,params)
+    test_data_source = External_Dataset(X_test,tokenizer,label_dict,params)
     
     
     train_dataloader= train_data_source.DataLoader
     val_dataloader= val_data_source.DataLoader
     test_dataloader= test_data_source.DataLoader
     if('deberta' in params['model_path']):
-        model = Deberta_Multilabel_Combined.from_pretrained(
+        model = DebertaV2_Multilabel_Combined.from_pretrained(
             params['model_path'], # Use the 12-layer BERT model, with an uncased vocab.
             cache_dir=params['cache_path'],
             params=params,
             weights=class_weights).to(device)
-    
     elif(('roberta' in params['model_path']) or (params['model_path']=='vinai/bertweet-base')):
         model = Roberta_Multilabel_Combined.from_pretrained(
             params['model_path'], # Use the 12-layer BERT model, with an uncased vocab.
             cache_dir=params['cache_path'],
             params=params,
             weights=class_weights).to(device)
-
     else:
         #### For other type of models
-        model = Bert_Multilabel_Combined.from_pretrained(
+        model = Bert_Seq_Class.from_pretrained(
             params['model_path'], # Use the 12-layer BERT model, with an uncased vocab.
             cache_dir=params['cache_path'],
-            params=params,
-            weights=class_weights).to(device)
+            params=params).to(device)
         
     optimizer = AdamW(model.parameters(),
                   lr = params['learning_rate'], # args.learning_rate - default is 5e-5, our notebook had 2e-5
@@ -369,24 +319,24 @@ def train(params,run, device):
             input_ids=batch[0]
             attention_mask=batch[1]
             labels=batch[2]
-            rationales=None
-            emotions=None
-            targets=None
-            ind=2
-            if('rationales' in params['features']):
-                ind+=1
-                rationales=batch[ind]
-            if('emotion' in params['features']):
-                ind+=1
-                emotions=batch[ind]
-            if(params['use_targets']):
-                ind+=1
-                targets=batch[ind]
+            
+#             rationales=None
+#             emotions=None
+#             targets=None
+#             ind=2
+#             if('rationales' in params['features']):
+#                 ind+=1
+#                 rationales=batch[ind]
+#             if('emotion' in params['features']):
+#                 ind+=1
+#                 emotions=batch[ind]
+#             if(params['use_targets']):
+#                 ind+=1
+#                 targets=batch[ind]
                 
             # (source: https://stackoverflow.com/questions/48001598/why-do-we-need-to-call-zero-grad-in-pytorch)
             model.zero_grad()        
-            outputs = model(input_ids=input_ids,attention_mask=attention_mask,labels=labels,
-                            rationales=rationales,emotion_vector=emotions,targets=targets)
+            outputs = model(input_ids=input_ids,attention_mask=attention_mask,labels=labels)
 
             # The call to `model` always returns a tuple, so we need to pull the 
             # loss value out of the tuple.
@@ -420,7 +370,7 @@ def train(params,run, device):
             scheduler.step()
         
         
-        train_dict,_,_=evalphase(params,run,'train',model,train_data_source_for_test.DataLoader,device)
+        #train_dict,_,_=evalphase(params,run,'train',model,train_data_source_for_test.DataLoader,device)
         val_dict,val_true,val_pred=evalphase(params,run,'val',model,val_dataloader,device)
         test_dict,test_true,test_pred=evalphase(params,run,'test',model,test_dataloader,device)
         
@@ -429,28 +379,23 @@ def train(params,run, device):
                 best_metrics_val[key]=val_dict[key]
                 best_metrics_test[key]=test_dict[key]
             dict_val={}
-            
-            print(len(val_data_source.dict_features['sentences']))
-            
-            
-            
-            for i in range(len(val_data_source.dict_features['sentences'])):
+            for i in range(len(val_data_source.sentences)):
                 dict_val[i]={}
-                dict_val[i]['sentences']=val_data_source.dict_features['sentences'][i]
+                dict_val[i]['sentences']=val_data_source.sentences[i]
                 dict_val[i]['true_labels']=val_true[i]
                 dict_val[i]['pred_labels']=val_pred[i]
             
             dict_test={}
-            for i in range(len(test_data_source.dict_features['sentences'])):
+            for i in range(len(test_data_source.sentences)):
                 dict_test[i]={}
-                dict_test[i]['sentences']=test_data_source.dict_features['sentences'][i]
+                dict_test[i]['sentences']=test_data_source.sentences[i]
                 dict_test[i]['true_labels']=test_true[i]
                 dict_test[i]['pred_labels']=test_pred[i]
             
             
 #             save_json(dict_test,'test',params)
 #             save_json(dict_val,'val',params)   
-#             save_detection_model(model,tokenizer,params)
+            save_detection_model(model,tokenizer,params)
         # Calculate the average loss over the training data.
         avg_train_loss = total_loss / len(train_dataloader)
         print('avg_train_loss',avg_train_loss)
@@ -484,9 +429,8 @@ params={
   'model':'bert',
   'features':'tfidf',
   'cache_path':'../../Saved_models/',
-  'model_path':'vinai/bertweet-base',
-  #'model_path':'Hate-speech-CNERG/dehatebert-mono-english',
-  'num_classes':3,
+  'model_path':'bert-base-uncased',
+  'num_classes':2,
   'batch_size':16,
   'max_length':256,
   'learning_rate':5e-5 ,  ### learning rate 2e-5 for bert 0.001 for gru
@@ -495,9 +439,8 @@ params={
   'dropout':0.1,
   'random_seed':2021,
   'device':'cuda',
-  'use_targets':True,
+  'use_targets':False,
   'targets_num':0,
-  'emotion_num':6,
   'features':[],
   'labels_agg':'majority',
   'save_path':'Saved_Models/',
@@ -510,52 +453,22 @@ params={
 
 if __name__ == "__main__":
     
-    my_parser = argparse.ArgumentParser()
-    my_parser.add_argument('path',
-                           metavar='--p',
-                           type=str,
-                           help='The path to json containining the parameters')
-    
-    my_parser.add_argument('index',
-                           metavar='--i',
-                           type=int,
-                           help='list id to be used')
-    
-    my_parser.add_argument('gpuid',
-                           metavar='--i',
-                           type=int,
-                           help='gpu id to be used')
-    
-    
-    
-    args = my_parser.parse_args()
-    
-    with open(args.path,mode='r') as f:
-            params_list = json.load(f)
-
-    params=params_list[args.index]
-    
     if torch.cuda.is_available() and params['device']=='cuda':    
         # Tell PyTorch to use the GPU.    
             device = torch.device("cuda")
             ##### You can set the device manually if you have only one gpu
             ##### comment this line if you don't want to manually set the gpu
-#             deviceID = get_gpu(1)
-#             torch.cuda.set_device(deviceID[0])
+            deviceID = get_gpu(0)
+            torch.cuda.set_device(deviceID[0])
             #### comment this line if you want to manually set the gpu
             #### required parameter is the gpu id
-            torch.cuda.set_device(args.gpuid)
+#             torch.cuda.set_device(1)
 
     else:
         print('Since you dont want to use GPU, using the CPU instead.')
         device = torch.device("cpu")
         
     fix_the_random(seed_val = params['random_seed'])
-    params['logging']='neptune'
-    params['epochs']=20
-    
-    if(params['model_path']=='microsoft/deberta-base'):
-        params['batch_size']=8
     run=None
     if(params['logging']=='neptune'):
         run = neptune.init(project=project_name,api_token=api_token)

@@ -241,8 +241,19 @@ def labels_weights(dataset):
     class_weights=[total/normal,total/fear,total/hate]
     return class_weights
         
-
-
+def return_annotator(dataset):
+    annotator_dict={}
+    count=0
+    for index,row in dataset.iterrows():
+        for annotator in row['annotations']:
+            try:
+                temp=annotator_dict[annotator['WorkerId']]
+            except KeyError:
+                annotator_dict[annotator['WorkerId']]=count
+                count+=1
+    
+    return annotator_dict
+    
 def train(params,run, device):
     if(run!=None):
         run["sys/tags"].add('baseline model')
@@ -262,9 +273,9 @@ def train(params,run, device):
     print(X_train.columns)
     
     
-    class_weights=labels_weights(X_train)
-    print(class_weights)
-    class_weights=torch.tensor(class_weights).to(device)
+    #class_weights=labels_weights(X_train)
+    
+    class_weights=torch.tensor([1.0,1.0,1.0]).to(device)
     if(params['model']!='bert'):
         pass
         ### Functions to extract features
@@ -279,6 +290,12 @@ def train(params,run, device):
     if(params['use_targets']):
         target_dict = return_targets(dataset,threshold=20)
         params['targets_num']=len(target_dict)
+    
+    if(params['labels_agg']=='crowdlayer'):
+        annotator_dict=return_annotator(dataset)
+    
+    
+    print(annotator_dict)
     
     
     if('deberta' in params['model_path']):
@@ -295,27 +312,34 @@ def train(params,run, device):
     train_dataloader= train_data_source.DataLoader
     val_dataloader= val_data_source.DataLoader
     test_dataloader= test_data_source.DataLoader
+    
     if('deberta' in params['model_path']):
         model = Deberta_Multilabel_Combined.from_pretrained(
             params['model_path'], # Use the 12-layer BERT model, with an uncased vocab.
             cache_dir=params['cache_path'],
             params=params,
             weights=class_weights).to(device)
-    
+        params['batch_size']=8
+        
+        
     elif(('roberta' in params['model_path']) or (params['model_path']=='vinai/bertweet-base')):
         model = Roberta_Multilabel_Combined.from_pretrained(
             params['model_path'], # Use the 12-layer BERT model, with an uncased vocab.
             cache_dir=params['cache_path'],
             params=params,
             weights=class_weights).to(device)
-
     else:
-        #### For other type of models
-        model = Bert_Multilabel_Combined.from_pretrained(
+        model = Bert_Multilabel_Combined_Anno.from_pretrained(
             params['model_path'], # Use the 12-layer BERT model, with an uncased vocab.
             cache_dir=params['cache_path'],
             params=params,
             weights=class_weights).to(device)
+      
+        #### For other type of models
+#         model = Bert_Seq_Class.from_pretrained(
+#             params['model_path'], # Use the 12-layer BERT model, with an uncased vocab.
+#             cache_dir=params['cache_path'],
+#             params=params).to(device)
         
     optimizer = AdamW(model.parameters(),
                   lr = params['learning_rate'], # args.learning_rate - default is 5e-5, our notebook had 2e-5
@@ -479,83 +503,52 @@ def train(params,run, device):
 #Saved_Models/hate_bert
 #Gab-dataset finetune 
 #Implcit hate finetune
-    
+
 params={
   'model':'bert',
   'features':'tfidf',
   'cache_path':'../../Saved_models/',
-  'model_path':'vinai/bertweet-base',
-  #'model_path':'Hate-speech-CNERG/dehatebert-mono-english',
+  'model_path':'bert-base-uncased',
   'num_classes':3,
-  'batch_size':16,
+  'batch_size':8,
   'max_length':256,
   'learning_rate':5e-5 ,  ### learning rate 2e-5 for bert 0.001 for gru
   'epsilon':1e-8,
   'epochs':20,
-  'dropout':0.1,
+  'dropout':0.5,
   'random_seed':2021,
   'device':'cuda',
   'use_targets':True,
-  'targets_num':0,
+  'targets_num':28,
   'emotion_num':6,
-  'features':[],
-  'labels_agg':'majority',
+  'features':['emotion'],
+  'labels_agg':'crowdlayer',
   'save_path':'Saved_Models/',
   'logging':'local'
 }
 
 # features can be empty or contain 'emotion','rationales'
-#'labels_agg' can be 'majority','crowd_layer','softlabel'
+#'labels_agg' can be 'majority','crowdlayer','softlabel'
 
 
 if __name__ == "__main__":
-    
-    my_parser = argparse.ArgumentParser()
-    my_parser.add_argument('path',
-                           metavar='--p',
-                           type=str,
-                           help='The path to json containining the parameters')
-    
-    my_parser.add_argument('index',
-                           metavar='--i',
-                           type=int,
-                           help='list id to be used')
-    
-    my_parser.add_argument('gpuid',
-                           metavar='--i',
-                           type=int,
-                           help='gpu id to be used')
-    
-    
-    
-    args = my_parser.parse_args()
-    
-    with open(args.path,mode='r') as f:
-            params_list = json.load(f)
-
-    params=params_list[args.index]
     
     if torch.cuda.is_available() and params['device']=='cuda':    
         # Tell PyTorch to use the GPU.    
             device = torch.device("cuda")
             ##### You can set the device manually if you have only one gpu
             ##### comment this line if you don't want to manually set the gpu
-#             deviceID = get_gpu(1)
+#             deviceID = get_gpu(0)
 #             torch.cuda.set_device(deviceID[0])
             #### comment this line if you want to manually set the gpu
             #### required parameter is the gpu id
-            torch.cuda.set_device(args.gpuid)
+            torch.cuda.set_device(1)
 
     else:
         print('Since you dont want to use GPU, using the CPU instead.')
         device = torch.device("cpu")
         
     fix_the_random(seed_val = params['random_seed'])
-    params['logging']='neptune'
-    params['epochs']=20
-    
-    if(params['model_path']=='microsoft/deberta-base'):
-        params['batch_size']=8
     run=None
     if(params['logging']=='neptune'):
         run = neptune.init(project=project_name,api_token=api_token)
