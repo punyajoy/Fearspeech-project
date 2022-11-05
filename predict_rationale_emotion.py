@@ -6,6 +6,9 @@ from model_code.rationale_model import *
 from data_handler.tf_processor import  *
 from model_code.model import *
 from tqdm import tqdm
+import zstandard as zstd
+import ujson
+import gensim
 import time
 import torch
 import numpy as np
@@ -18,8 +21,9 @@ from apiconfig import project_name,api_token
 import neptune.new as neptune
 import GPUtil
 import pickle
-    
-model_memory=9
+import pickle5 as pickle
+
+model_memory=7
 total_memory=16
 
 def get_gpu(gpu_id):
@@ -46,10 +50,10 @@ def predict(params, device):
     with open("../../Gab_Data/gab_hate.json", "r") as fin:
         Gab_keyword_match= json.load(fin)
     
-    tokenizer_emotions = AutoTokenizer.from_pretrained("monologg/bert-base-cased-goemotions-original",use_fast=False, cache_dir=params['cache_path'])
-    tokenizer_rationales = AutoTokenizer.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two",use_fast=False, cache_dir=params['cache_path'])
-    model_emotion = BertForMultiLabelClassification.from_pretrained("monologg/bert-base-cased-goemotions-original",cache_dir=params['cache_path']).to(device)
-    model_rationale = Model_Rational_Label.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two",cache_dir=params['cache_path']).to(device)
+    tokenizer_emotions = AutoTokenizer.from_pretrained("monologg/bert-base-cased-goemotions-original",use_fast=False)
+    tokenizer_rationales = AutoTokenizer.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two",use_fast=False)
+    model_emotion = BertForMultiLabelClassification.from_pretrained("monologg/bert-base-cased-goemotions-original").to(device)
+    model_rationale = Model_Rational_Label.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two").to(device)
     
     
     model_rationale.eval()
@@ -128,14 +132,286 @@ def predict(params, device):
             temp[k]['emotion_dict']=emotion_dict
             temp[k]['rationale_dict']=rationale_dict
         
-        with open('../../Gab_Data/features/gab_fear_hate_features'+str(i)+'.pickle', 'wb') as fout:
+        with open('../../Gab_Data/new_features/gab_fear_hate_features'+str(i)+'.pickle', 'wb') as fout:
              pickle.dump(temp, fout,protocol=pickle.HIGHEST_PROTOCOL)    
  
 
         #Gab_keyword_match_prob+=temp
 
+
+class Zreader:
+    def __init__(self, file, chunk_size=16384):
+        '''Init method'''
+        self.fh = open(file,'rb')
+        self.chunk_size = chunk_size
+        self.dctx = zstd.ZstdDecompressor()
+        self.reader = self.dctx.stream_reader(self.fh)
+        self.buffer = ''
+
+
+    def readlines(self):
+        '''Generator method that creates an iterator for each line of JSON'''
+        while True:
+            chunk = self.reader.read(self.chunk_size).decode()
+            if not chunk:
+                break
+            lines = (self.buffer + chunk).split("\n")
+
+            for line in lines[:-1]:
+                yield line
+
+            self.buffer = lines[-1]
+            
+            
+            
+def predict_whole(params, device):
+    file_gab='../../Gab_Data/gab_corpus2.ndjson.zst'
+    zreader=Zreader(file_gab,chunk_size=2**16)
+    tokenizer_emotions = AutoTokenizer.from_pretrained("monologg/bert-base-cased-goemotions-original",use_fast=False)
+    tokenizer_rationales = AutoTokenizer.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two",use_fast=False)
+    model_emotion = BertForMultiLabelClassification.from_pretrained("monologg/bert-base-cased-goemotions-original").to(device)
+    model_rationale = Model_Rational_Label.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two").to(device)
     
+    model_rationale.eval()
+    model_emotion.eval()
+
+    
+    pbar = tqdm(total=1000000)
+    flag=0
+    count=0
+    files_index=0
+    posts=[]
+    while True:
+        pbar.update(1)
+        try:
+            chunk1 = zreader.reader.read(zreader.chunk_size)
+            chunk_decoded = chunk1.decode()
+        except UnicodeDecodeError:
+            chunk2 = zreader.reader.read(100)
+            try:
+                chunk_decoded = (chunk1+chunk2).decode()
+            except UnicodeDecodeError:
+                continue
+        if not chunk_decoded:
+            break
+        lines = (zreader.buffer + chunk_decoded).split("\n")
+        for line in lines[:-1]:
+            try:
+                temp = ujson.loads(line)
+                posts.append(temp)
+                count+=1
+            except:
+                pass
         
+        ### prediction json
+        if(count>100000):
+            print(count,len(posts))
+            files_index+=1
+            print(files_index)
+            try:
+                with open('../../Gab_Data/new_features/gab_fear_hate_features'+str(files_index)+'.pkl', 'rb') as handle:
+                     Gab_keyword_match = pickle.load(handle)
+
+                if(params['reset']==False):
+                    if('emotion_dict' in Gab_keyword_match[1].keys()):
+                        posts=[]
+                        count=0
+                        continue
+            except FileNotFoundError as e:
+                pass
+            
+            test_data_source = Prediction_Dataset(posts,tokenizer_emotions, params)
+            test_dataloader= test_data_source.DataLoader
+            predictions_emotion=[]
+            for batch in tqdm(test_dataloader,total=len(test_dataloader)):
+              # Add batch to GPU
+                batch = tuple(t.to(device) for t in batch)
+
+                # Unpack the inputs from our dataloader
+                b_input_ids, b_input_mask = batch
+
+                # Telling the model not to compute or store gradients, saving memory and 
+                # speeding up prediction
+                with torch.no_grad():
+                  # Forward pass, calculate logit predictions
+                    outputs_emotion = model_emotion(b_input_ids,attention_mask=b_input_mask)
+
+
+                logits_emotion = outputs_emotion[0]
+                logits_emotion = torch.sigmoid(logits_emotion)
+                # Move logits and labels to CPU
+                logits_emotion = list(logits_emotion.detach().cpu().numpy())
+
+                predictions_emotion+=logits_emotion
+            
+            test_data_source = Prediction_Dataset(posts,tokenizer_rationales, params)
+            test_dataloader= test_data_source.DataLoader
+            tokenized_sentences=test_data_source.tokenized_inputs
+            predictions_rationale=[]
+            for batch in tqdm(test_dataloader,total=len(test_dataloader)):
+              # Add batch to GPU
+                batch = tuple(t.to(device) for t in batch)
+
+                # Unpack the inputs from our dataloader
+                b_input_ids, b_input_mask = batch
+
+                # Telling the model not to compute or store gradients, saving memory and 
+                # speeding up prediction
+                with torch.no_grad():
+                  # Forward pass, calculate logit predictions
+                    _,outputs_rationale = model_rationale(b_input_ids,attention_mask=b_input_mask)
+
+
+                logits_rationale = outputs_rationale
+                logits_rationale = torch.softmax(logits_rationale.T, dim=0).T
+                # Move logits and labels to CPU
+                logits_rationale = list(logits_rationale.detach().cpu().numpy())
+
+                predictions_rationale+=logits_rationale
+            
+            for k in range(len(posts)):
+                rationale_dict={}
+                for x,y in zip(tokenized_sentences[k],predictions_rationale[k][1:]):
+                    rationale_dict[x]=y[1]
+
+                emotion_dict={}   
+                predictions_emotion[k]
+                for idx,value in enumerate(predictions_emotion[k]):
+                    emotion_dict[model_emotion.config.id2label[idx]]=value
+                posts[k]['emotion_dict']=emotion_dict
+                posts[k]['rationale_dict']=rationale_dict
+            
+            print(files_index)
+            with open('../../Gab_Data/new_features/gab_fear_hate_features'+str(files_index)+'.pickle', 'wb') as fout:
+                 pickle.dump(posts, fout,protocol=pickle.HIGHEST_PROTOCOL)    
+            
+            posts=[]
+            count=0
+        zreader.buffer = lines[-1]
+    pbar.close() 
+    print(count)
+
+
+    
+    
+def predict_whole_emotions(params, device):
+    tokenizer_emotions = AutoTokenizer.from_pretrained("monologg/bert-base-cased-goemotions-original",use_fast=False)
+    model_emotion = BertForMultiLabelClassification.from_pretrained("monologg/bert-base-cased-goemotions-original").to(device)
+    model_emotion.eval()
+
+    
+#     with open('/home/punyajoy/Gab_Data_old/Final_Posts.pkl','rb') as fp:
+#         dict_posts = pickle.load(fp)
+    
+#     files=sorted(glob('../../Gab_Data/new_features_old_gab/*.pickle'))
+    files=sorted(glob('../../../../Newhd/Punyajoy_folders/works_2021/Fearspeech_Additional/Facebook_Data/*.pkl'))
+    
+    for file in tqdm(files,total=len(files)):
+        with open(file, 'rb') as handle:
+            temp = pickle.load(handle)
+            
+        if(params['reset']==False):
+            if('emotion_dict' in temp[1].keys()):
+                 continue
+        test_data_source = Prediction_Dataset(temp,tokenizer_emotions, params)
+        test_dataloader= test_data_source.DataLoader
+        predictions_emotion=[]
+        for batch in tqdm(test_dataloader,total=len(test_dataloader)):
+          # Add batch to GPU
+            batch = tuple(t.to(device) for t in batch)
+
+            # Unpack the inputs from our dataloader
+            b_input_ids, b_input_mask = batch
+
+            # Telling the model not to compute or store gradients, saving memory and 
+            # speeding up prediction
+            with torch.no_grad():
+              # Forward pass, calculate logit predictions
+                outputs_emotion = model_emotion(b_input_ids,attention_mask=b_input_mask)
+
+
+            logits_emotion = outputs_emotion[0]
+            logits_emotion = torch.sigmoid(logits_emotion)
+            # Move logits and labels to CPU
+            logits_emotion = list(logits_emotion.detach().cpu().numpy())
+
+            predictions_emotion+=logits_emotion
+
+        for k in range(len(temp)):
+            emotion_dict={}   
+            predictions_emotion[k]
+            for idx,value in enumerate(predictions_emotion[k]):
+                emotion_dict[model_emotion.config.id2label[idx]]=value
+            temp[k]['emotion_dict']=emotion_dict
+
+        with open(file, 'wb') as fout:
+             pickle.dump(temp, fout,protocol=pickle.HIGHEST_PROTOCOL)    
+
+                
+                
+def predict_whole_rationales(params, device):
+    tokenizer_rationales = AutoTokenizer.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two",use_fast=False)
+    model_rationale = Model_Rational_Label.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two").to(device)
+    
+    model_rationale.eval()
+    
+    
+#     with open('/home/punyajoy/Gab_Data_old/Final_Posts.pkl','rb') as fp:
+#         dict_posts = pickle.load(fp)
+    files=sorted(glob('../../../../Newhd/Punyajoy_folders/works_2021/Fearspeech_Additional/Facebook_Data/*.pkl'))
+    
+#     files=sorted(glob('../../Gab_Data/new_features_old_gab/*.pickle'))
+    for file in tqdm(files,total=len(files)):
+        with open(file, 'rb') as handle:
+            temp = pickle.load(handle)
+            
+        if(params['reset']==False):
+            if('rationale_dict' in temp[1].keys()):
+                 continue
+        test_data_source = Prediction_Dataset(temp,tokenizer_rationales, params)
+        test_dataloader= test_data_source.DataLoader
+        tokenized_sentences=test_data_source.dict_features['tokenized_inputs']
+        predictions_rationale=[]
+        for batch in tqdm(test_dataloader,total=len(test_dataloader)):
+          # Add batch to GPU
+            batch = tuple(t.to(device) for t in batch)
+
+            # Unpack the inputs from our dataloader
+            b_input_ids, b_input_mask = batch
+
+            # Telling the model not to compute or store gradients, saving memory and 
+            # speeding up prediction
+            with torch.no_grad():
+              # Forward pass, calculate logit predictions
+                _,outputs_rationale = model_rationale(b_input_ids,attention_mask=b_input_mask)
+
+
+            logits_rationale = outputs_rationale
+            logits_rationale = torch.softmax(logits_rationale.T, dim=0).T
+            # Move logits and labels to CPU
+            logits_rationale = list(logits_rationale.detach().cpu().numpy())
+
+            predictions_rationale+=logits_rationale
+
+        for k in range(len(temp)):
+            rationale_dict={}
+            for x,y in zip(tokenized_sentences[k],predictions_rationale[k][1:]):
+                rationale_dict[x]=y[1]
+
+            temp[k]['rationale_dict']=rationale_dict
+
+        with open(file, 'wb') as fout:
+             pickle.dump(temp, fout,protocol=pickle.HIGHEST_PROTOCOL)    
+                
+                
+                
+                
+                
+                
+                
+                
+                
+   
 
 def predict_original(params, device):
     with open('dataset/final_dataset.json', 'r') as fp:
@@ -143,10 +419,10 @@ def predict_original(params, device):
     
     #emotion_bert='bhadresh-savani/bert-base-uncased-emotion'
     emotion_bert='monologg/bert-base-cased-goemotions-original'
-    tokenizer_emotions = AutoTokenizer.from_pretrained(emotion_bert,use_fast=False, cache_dir=params['cache_path'])
-    tokenizer_rationales = AutoTokenizer.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two",use_fast=False, cache_dir=params['cache_path'])
-    model_emotion = BertForMultiLabelClassification.from_pretrained(emotion_bert,cache_dir=params['cache_path']).to(device)
-    model_rationale = Model_Rational_Label.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two",cache_dir=params['cache_path']).to(device)
+    tokenizer_emotions = AutoTokenizer.from_pretrained(emotion_bert,use_fast=False)
+    tokenizer_rationales = AutoTokenizer.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two",use_fast=False)
+    model_emotion = BertForMultiLabelClassification.from_pretrained(emotion_bert).to(device)
+    model_rationale = Model_Rational_Label.from_pretrained("Hate-speech-CNERG/bert-base-uncased-hatexplain-rationale-two").to(device)
     
     
     model_rationale.eval()
@@ -226,9 +502,32 @@ def predict_original(params, device):
         
     with open('dataset/final_dataset_emotion_rationale.json', 'w') as fp:
         json.dump(json_data, fp, indent=4)
+
+        
     
-    
-    
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
     
 params={
   'model':'bert',
@@ -237,7 +536,8 @@ params={
   'model_path':'Saved_Models/bert-base-uncased_fear_hate',
   #'model_path':'Hate-speech-CNERG/dehatebert-mono-english',
   'num_classes':3,
-  'batch_size':64,
+  'batch_size':128,
+  'reset':True,
   'max_length':256,
   'learning_rate':2e-5 ,  ### learning rate 2e-5 for bert 0.001 for gru
   'epsilon':1e-8,
@@ -262,7 +562,7 @@ if __name__ == "__main__":
 #             torch.cuda.set_device(deviceID[0])
             #### comment this line if you want to manually set the gpu
             #### required parameter is the gpu id
-            torch.cuda.set_device(1)
+            torch.cuda.set_device(0)
 
     else:
         print('Since you dont want to use GPU, using the CPU instead.')
@@ -270,7 +570,9 @@ if __name__ == "__main__":
         
     #fix_the_random(seed_val = params['random_seed'])
     
+    predict_whole_rationales(params, device)
+    predict_whole_emotions(params, device)
     
-    predict(params, device)
+#     predict_original(params, device)
     
     

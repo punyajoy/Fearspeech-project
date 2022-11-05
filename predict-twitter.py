@@ -86,7 +86,7 @@ def predict(params, device):
     model.eval()
     
     
-    files=sorted(glob('../../Gab_Data/new_features_old_gab/*.pickle'))
+    files=sorted(glob('../../../../NewHd/Punyajoy_folders/works_2021/Fearspeech_Additional/Facebook_Data/*.pkl'))
     for file in tqdm(files,total=len(files)):
         with open(file, 'rb') as handle:
             temp = pickle.load(handle)
@@ -153,7 +153,7 @@ params={
   'cache_path':'../../Saved_models/',
   'model_path':'Saved_Models/pretrain_bert_emotion_majority_fear_hate',
   'num_classes':3,
-  'batch_size':256,
+  'batch_size':128,
   'max_length':256,
   'learning_rate':2e-5 ,  ### learning rate 2e-5 for bert 0.001 for gru
   'epsilon':1e-8,
@@ -179,8 +179,9 @@ if __name__ == "__main__":
             device = torch.device("cuda")
             ##### You can set the device manually if you have only one gpu
             ##### comment this line if you don't want to manually set the gpu
-#             deviceID = get_gpu(1)
-#             torch.cuda.set_device(deviceID[0])
+#            deviceID = get_gpu(0)
+            print(device)
+#            torch.cuda.set_device(deviceID[0])
             #### comment this line if you want to manually set the gpu
             #### required parameter is the gpu id
             torch.cuda.set_device(1)
